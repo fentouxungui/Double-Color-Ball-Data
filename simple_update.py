@@ -13,14 +13,20 @@ from datetime import datetime
 import os
 
 def get_latest_period_from_csv(csv_file='lottery_data.csv'):
-    """从CSV文件中获取最新的期号"""
+    """从CSV文件中获取最新的期号（通过比较所有期号）"""
     try:
-        with open(csv_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            if len(lines) > 1:
-                last_line = lines[-1].strip()
-                latest_period = last_line.split(',')[0]
-                return latest_period
+        with open(csv_file, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            periods = []
+            for row in reader:
+                period = row.get('期号', '').strip()
+                if period and period.isdigit():
+                    periods.append(int(period))
+
+            if periods:
+                # 返回最大的期号
+                latest_period = max(periods)
+                return str(latest_period)
         return None
     except Exception as e:
         print(f"读取CSV文件失败: {e}")
@@ -144,11 +150,6 @@ def sort_csv_by_period_desc(csv_file='lottery_data.csv'):
         print()
         print("正在按期号排序（从新到旧）...", end=' ')
 
-        # 备份原文件
-        backup_file = csv_file.replace('.csv', '_before_sort.csv')
-        import shutil
-        shutil.copy2(csv_file, backup_file)
-
         # 读取所有数据（使用utf-8-sig处理BOM）
         data_list = []
         with open(csv_file, 'r', encoding='utf-8-sig') as f:
@@ -174,7 +175,6 @@ def sort_csv_by_period_desc(csv_file='lottery_data.csv'):
             writer.writerows(data_list)
 
         print(f"[完成]")
-        print(f"已备份原文件到: {backup_file}")
         print(f"最新期号: {data_list[0]['期号'] if data_list else 'N/A'}")
 
         return True
