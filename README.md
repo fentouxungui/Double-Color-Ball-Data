@@ -28,5 +28,9 @@ CSV文件格式：
 
 ## 数据更新
 
-参考``数据更新指南.md``添加最新数据。
+数据已配置为自动更新：GitHub Actions 会在**每周一、三、五北京时间 09:23（UTC 01:23）**运行 `.github/workflows/update-lottery-data.yml`，执行 `simple_update.py` 抓取网易彩票最新开奖结果并写入 `lottery_data.csv`，有新数据时自动提交到本仓库。
+
+也可以在 GitHub 仓库的 **Actions → 更新双色球数据 → Run workflow** 手动触发一次更新。
+
+如需在本机手动更新或补充历史数据，参考 `数据更新指南.md`。
 

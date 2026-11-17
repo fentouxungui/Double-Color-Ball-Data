@@ -1,0 +1,188 @@
+name: 更新双色球数据
+
+on:
+  schedule:
+    # 每周一、三、五 09:23（北京时间）运行，对应上周日/二/四晚开奖后的次日。
+    # GitHub Actions 的 cron 使用 UTC：01:23 UTC = 09:23 北京时间。
+    - cron: '23 1 * * 1,3,5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-lottery-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: python -m pip install --quiet requests
+
+      - name: 预检数据源
+        run: |
+          python - <<'PY'
+          import csv, sys, time
+          import requests
+
+          with open("lottery_data.csv", encoding="utf-8-sig", newline="") as f:
+              rows = list(csv.DictReader(f))
+          if not rows:
+              print("lottery_data.csv 没有数据行")
+              sys.exit(1)
+
+          latest = (rows[0].get("期号") or "").strip()
+          url = "https://sports.163.com/caipiao/lottery/ssq/" + latest
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          }
+
+          for attempt in range(1, 4):
+              try:
+                  r = requests.get(url, headers=headers, timeout=20)
+                  print("预检 %s -> HTTP %d" % (url, r.status_code))
+                  if r.status_code == 200:
+                      sys.exit(0)
+              except Exception as e:
+                  print("预检第 %d 次失败: %s" % (attempt, e))
+              time.sleep(5)
+
+          print("数据源不可用，终止本次更新")
+          sys.exit(1)
+          PY
+
+      - name: 运行 simple_update.py
+        run: |
+          set -o pipefail
+          python simple_update.py | tee update.log
+          grep -q "更新完成" update.log || { echo "simple_update.py 未正常完成"; exit 1; }
+          if grep -qE "出错|失败" update.log; then
+            echo "simple_update.py 输出中检测到错误"
+            exit 1
+          fi
+
+      - name: 校验 CSV
+        run: |
+          python - <<'PY'
+          import csv, io, re, subprocess, sys
+          from collections import Counter
+          from datetime import datetime
+
+          PATH = "lottery_data.csv"
+          EXPECTED = ["期号", "开奖日期", "红球", "蓝球", "排序红球", "排序蓝球",
+                      "出球顺序", "销售额", "奖池金额", "星期"]
+          errors = []
+
+          def load(text):
+              reader = csv.DictReader(io.StringIO(text))
+              header = [(h or "").strip() for h in (reader.fieldnames or [])]
+              rows = [{(k or "").strip(): v for k, v in r.items()} for r in reader]
+              return header, rows
+
+          def check_row(r, label):
+              period = (r.get("期号") or "").strip()
+              date = (r.get("开奖日期") or "").strip()
+              red = (r.get("红球") or "").split()
+              red_sorted = (r.get("排序红球") or "").split()
+              blue = (r.get("蓝球") or "").strip()
+              blue_sorted = (r.get("排序蓝球") or "").strip()
+              if not re.fullmatch(r"\d{7}", period):
+                  errors.append("%s 期号异常: %r" % (label, period))
+              try:
+                  datetime.strptime(date, "%Y/%m/%d")
+              except ValueError:
+                  errors.append("%s 开奖日期异常: %r" % (label, date))
+              if len(red) != 6 or any(not re.fullmatch(r"\d{2}", n) for n in red):
+                  errors.append("%s 红球异常: %r" % (label, " ".join(red)))
+              elif red_sorted and red_sorted != sorted(red):
+                  errors.append("%s 排序红球与红球不一致" % label)
+              if not re.fullmatch(r"\d{2}", blue):
+                  errors.append("%s 蓝球异常: %r" % (label, blue))
+              elif blue_sorted and blue_sorted != blue:
+                  errors.append("%s 排序蓝球与蓝球不一致" % label)
+
+          with open(PATH, encoding="utf-8-sig", newline="") as f:
+              header, rows = load(f.read())
+
+          head_text = subprocess.run(
+              ["git", "show", "HEAD:" + PATH],
+              check=True, capture_output=True,
+          ).stdout.decode("utf-8-sig")
+          head_header, head_rows = load(head_text)
+
+          if header != EXPECTED:
+              errors.append("当前表头异常: %r" % (header,))
+          if head_header != EXPECTED:
+              errors.append("HEAD 表头异常: %r" % (head_header,))
+          if not rows:
+              errors.append("CSV 没有数据行")
+
+          cur_periods = [(r.get("期号") or "").strip() for r in rows]
+          head_periods = [(r.get("期号") or "").strip() for r in head_rows]
+          head_set = set(head_periods)
+          hc = Counter(head_periods)
+          cc = Counter(cur_periods)
+
+          cur_set = set(cur_periods)
+          missing = [p for p in hc if p not in cur_set]
+          if missing:
+              errors.append("原有期号丢失: %s" % ", ".join(missing[:10]))
+
+          for p, c in cc.items():
+              if c > max(hc.get(p, 0), 1):
+                  errors.append("期号重复: %s" % p)
+
+          new_rows = [r for r in rows if (r.get("期号") or "").strip() not in head_set]
+          if len(new_rows) > 40:
+              errors.append("新增行数异常: %d" % len(new_rows))
+          for r in new_rows:
+              check_row(r, "新增期 %s" % (r.get("期号") or "?"))
+
+          # 排序检查只针对新增行参与的相邻关系，避免历史数据的既有问题阻断更新
+          new_set = {(r.get("期号") or "").strip() for r in new_rows}
+          for i in range(1, len(rows)):
+              a, b = cur_periods[i - 1], cur_periods[i]
+              if not (a.isdigit() and b.isdigit()):
+                  continue
+              if int(a) < int(b) and (a in new_set or b in new_set):
+                  errors.append("排序异常: %s 位于 %s 之前" % (a, b))
+
+          if errors:
+              print("CSV 校验失败：")
+              for e in errors[:30]:
+                  print(" -", e)
+              sys.exit(1)
+
+          if new_rows:
+              print("CSV 校验通过：新增 %d 期，最新 %s（%s），共 %d 期" % (
+                  len(new_rows),
+                  (rows[0].get("期号") or "").strip(),
+                  (rows[0].get("开奖日期") or "").strip(),
+                  len(rows)))
+          else:
+              print("CSV 校验通过：没有新增数据，共 %d 期，最新 %s" % (
+                  len(rows), (rows[0].get("期号") or "").strip()))
+          PY
+
+      - name: 提交并推送
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add lottery_data.csv
+          if git diff --cached --quiet; then
+            echo "没有新数据，跳过提交"
+          else
+            git commit -m "chore: 更新双色球开奖数据 ($(date -u +%Y-%m-%d))"
+            git push
+          fi
